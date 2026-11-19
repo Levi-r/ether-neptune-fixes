@@ -335,9 +335,11 @@ func TestPlaybackInfoListsConfiguredVersionSlots(t *testing.T) {
 	slot := func(id, name string) frontend.Version {
 		return frontend.Version{ID: frontend.VersionSelectorPrefix + id, Name: name, Media: frontend.MediaInfo{Estimated: true}}
 	}
+	fourK := slot("4k", "4K")
+	fourK.Media.Streams = []frontend.StreamInfo{{Type: "video", Codec: "h264", Height: 2160, Width: 3840}}
 	detail := frontend.ItemDetail{
 		Title:    frontend.Title{Key: 5, Type: "movie", Title: "Movie"},
-		Versions: []frontend.Version{slot("default", "Default"), slot("4k", "4K"), slot("720", "720p")},
+		Versions: []frontend.Version{slot("default", "Default"), fourK, slot("720", "720p")},
 	}
 	handles := newVariantHandles(5, frontend.VersionSelectorPrefix+"4k", frontend.VersionSelectorPrefix+"720")
 	sessions := frontendtest.Sessions{PlanFunc: func(context.Context, frontend.PlanRequest) (frontend.PlayPlan, error) {
@@ -361,6 +363,22 @@ func TestPlaybackInfoListsConfiguredVersionSlots(t *testing.T) {
 		}
 		if sources[1]["Id"] != handleFor(frontend.VersionSelectorPrefix+"4k") || sources[1]["Name"] != "4K" || sources[2]["Name"] != "720p" {
 			t.Fatalf("%s: slots missing: %v", body, sources)
+		}
+		// Neptune labels versions from the video stream, not Name: the 4K
+		// slot carries its resolution and name, never the estimated codec.
+		streams, _ := sources[1]["MediaStreams"].([]any)
+		video, _ := func() (map[string]any, bool) {
+			if len(streams) != 1 {
+				return nil, false
+			}
+			m, ok := streams[0].(map[string]any)
+			return m, ok
+		}()
+		if video == nil || video["Height"] != float64(2160) || video["DisplayTitle"] != "4K" || video["Codec"] != nil {
+			t.Fatalf("%s: 4K slot video stream: %v", body, sources[1]["MediaStreams"])
+		}
+		if s, _ := sources[2]["MediaStreams"].([]any); len(s) != 0 {
+			t.Fatalf("%s: 720p slot without a known height got streams: %v", body, s)
 		}
 		if got := w.Header().Get(versionCountHeader); got != "3" {
 			t.Fatalf("%s: version count header %q", body, got)

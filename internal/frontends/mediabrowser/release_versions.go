@@ -428,6 +428,7 @@ func (i *instance) playbackSlotSources(r *http.Request, v *frontend.Viewer, cred
 	out := []any{auto}
 	for _, version := range d.Versions[1:] {
 		if source, ok := i.slotVersionSource(r, v, credential, scope, key, d.Title, version, nil); ok {
+			describeSlotVideo(source, version)
 			matchAutoDelivery(r, source, auto, key)
 			out = append(out, source)
 		}
@@ -465,4 +466,35 @@ func matchAutoDelivery(r *http.Request, source, auto map[string]any, key fronten
 	if container, ok := auto["TranscodingContainer"]; ok {
 		source["TranscodingContainer"] = container
 	}
+}
+
+// describeSlotVideo gives a listed version-menu slot that has no probed
+// streams one video stream carrying only its configured resolution and name.
+// Apps such as Neptune label a version from its video stream (height, codec,
+// range) and ignore MediaSource.Name, so without it every slot reads "SDR".
+// A slot's resolution is its definition, not a guess about a file; codec,
+// range and size stay unpublished until the version is played.
+func describeSlotVideo(source map[string]any, version frontend.Version) {
+	if streams, _ := source["MediaStreams"].([]any); len(streams) > 0 {
+		return
+	}
+	height, width := 0, 0
+	for _, stream := range version.Media.Streams {
+		if stream.Type == "video" && stream.Height > 0 {
+			height, width = stream.Height, stream.Width
+			break
+		}
+	}
+	if height == 0 {
+		return
+	}
+	if width == 0 {
+		width = height * 16 / 9
+	}
+	video := map[string]any{"Index": 0, "Type": "Video", "Height": height, "Width": width, "IsDefault": true, "IsExternal": false, "IsInterlaced": false}
+	if version.Name != "" {
+		video["Title"] = version.Name
+		video["DisplayTitle"] = version.Name
+	}
+	source["MediaStreams"] = []any{video}
 }
