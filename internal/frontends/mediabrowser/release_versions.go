@@ -3,6 +3,7 @@ package mediabrowser
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -222,6 +223,9 @@ func (i *instance) releaseVersionSourcesFor(r *http.Request, scope frontend.Vers
 		if !ok {
 			continue
 		}
+		if auto != nil {
+			matchAutoDelivery(r, source, auto, key)
+		}
 		out = append(out, source)
 		offered++
 	}
@@ -424,6 +428,7 @@ func (i *instance) playbackSlotSources(r *http.Request, v *frontend.Viewer, cred
 	out := []any{auto}
 	for _, version := range d.Versions[1:] {
 		if source, ok := i.slotVersionSource(r, v, credential, scope, key, d.Title, version, nil); ok {
+			matchAutoDelivery(r, source, auto, key)
 			out = append(out, source)
 		}
 	}
@@ -431,4 +436,33 @@ func (i *instance) playbackSlotSources(r *http.Request, v *frontend.Viewer, cred
 		return nil
 	}
 	return out
+}
+
+// matchAutoDelivery gives a listed version the delivery Auto was given when
+// this device was told not to direct play (its declared profile cannot play
+// the file): an HLS TranscodingUrl, here the version's own HLS alias, which
+// opens a session for exactly that version. Otherwise the version keeps the
+// direct-play shape the item page gives it.
+func matchAutoDelivery(r *http.Request, source, auto map[string]any, key frontend.RatingKey) {
+	if _, ok := auto["TranscodingUrl"].(string); !ok {
+		return
+	}
+	if direct, _ := auto["SupportsDirectPlay"].(bool); direct {
+		return
+	}
+	handle, _ := source["Id"].(string)
+	if handle == "" {
+		return
+	}
+	prefix, _ := r.Context().Value(prefixKey{}).(string)
+	source["SupportsDirectPlay"] = false
+	source["SupportsDirectStream"] = false
+	source["SupportsTranscoding"] = true
+	source["Protocol"] = "Http"
+	delete(source, "Path")
+	source["TranscodingUrl"] = prefix + "/Videos/" + ids.RatingKeyGUID(key) + "/master.m3u8?MediaSourceId=" + url.QueryEscape(handle)
+	source["TranscodingSubProtocol"] = "hls"
+	if container, ok := auto["TranscodingContainer"]; ok {
+		source["TranscodingContainer"] = container
+	}
 }

@@ -1433,6 +1433,15 @@ func (i *instance) streamAlias(w http.ResponseWriter, r *http.Request) {
 		}
 		sessionID = session.ID
 	}
+	// A picked version (or detail source) is served only from a session
+	// that plays exactly it. Apps such as Neptune open a version chosen from
+	// PlaybackInfo's list straight from this URL, while the session that
+	// PlaybackInfo started plays Auto.
+	// A client that names its PlaySessionId keeps the strict check below.
+	versionPicked := channel == "" && (version != "" || detailSource != "") && (len(vals) == 0 || vals[0] == "")
+	if versionPicked && sessionID != "" && !i.sessionPlaysSource(r, versionScope, version, detailSource, sessionID) {
+		sessionID = ""
+	}
 	// Infuse opens PlaybackInfo, then ignores PlaySessionId and reads
 	// /Videos/{id}/stream?Static=true. Reuse the session PlaybackInfo
 	// already started so Range hits the same file. Without a session,
@@ -1453,11 +1462,63 @@ func (i *instance) streamAlias(w http.ResponseWriter, r *http.Request) {
 		lazy.ServeAuthenticated(w, r, credential, request)
 		return
 	}
+	if sessionID == "" && versionPicked {
+		i.servePickedVersion(w, r, viewer, access, key, versionScope, version, detailSource, expectedETag, format)
+		return
+	}
 	if sessionID == "" {
 		http.NotFound(w, r)
 		return
 	}
 	i.serveAliasSession(w, r, access, sessions, sessionID, versionScope, version, detailSource, format)
+}
+
+// sessionPlaysSource reports whether sessionID plays exactly the picked
+// version handle or detail source.
+func (i *instance) sessionPlaysSource(r *http.Request, scope frontend.VersionScope, version, detailSource, sessionID string) bool {
+	if version != "" && (i.host.VersionHandles == nil || i.host.VersionHandles.MatchSession(i.identityContext(r), scope, version, sessionID) != nil) {
+		return false
+	}
+	if detailSource != "" {
+		planner, ok := i.host.Sessions.(frontend.DetailPlanner)
+		if !ok || planner.MatchDetailSession(i.identityContext(r), scope, detailSource, sessionID) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// servePickedVersion opens a playback session for exactly the picked version
+// (or detail source) and serves it. The broker plans with the caps this
+// device last declared for playback, so a client that cannot play the file
+// directly is redirected to an HLS stream of it even from /stream.
+func (i *instance) servePickedVersion(w http.ResponseWriter, r *http.Request, viewer *frontend.Viewer, access frontend.SessionAccess, key frontend.RatingKey, scope frontend.VersionScope, version, detailSource, expectedETag string, format frontend.StreamFormat) {
+	if i.host.Capabilities == nil {
+		http.Error(w, "Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	dev := access.Device
+	capability, err := i.host.Capabilities.Build(i.identityContext(r), frontend.CapabilityRequest{Viewer: viewer, Device: caps.DeviceInfo{Protocol: i.protocol, ClientID: dev.ID, Product: dev.Client, DeviceName: dev.DeviceName, Version: dev.Version}, UserAgent: r.UserAgent()})
+	if err != nil {
+		http.Error(w, "Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	allow := true
+	plan, err := i.host.Sessions.Plan(r.Context(), frontend.PlanRequest{Viewer: viewer, Device: dev, Protocol: i.protocol, Item: key, Version: version, DetailSource: detailSource, ExpectedSourceETag: expectedETag, Caps: capability.Client, Intent: frontend.PlayIntent{ExactVersion: version != "", AllowTranscoding: &allow, Options: frontend.DecideOptions{DirectPlay: true, DirectStream: true}}})
+	if err != nil {
+		streamError(i.protocol, w, err)
+		return
+	}
+	session, err := i.host.Sessions.Open(r.Context(), frontend.OpenRequest{Protocol: i.protocol, PlanID: plan.ID, Viewer: viewer, Device: dev})
+	if err != nil {
+		streamError(i.protocol, w, err)
+		return
+	}
+	if format == frontend.StreamDirect && plan.Decision.Kind != "directplay" {
+		format = frontend.StreamHLS
+	}
+	// The session was planned for exactly this source; no handle re-check.
+	i.serveAliasSession(w, r, access, []frontend.Session{session}, session.ID, scope, "", "", format)
 }
 
 // Both MediaBrowser dialects resolve tune failures with a native playback code.
