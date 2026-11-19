@@ -47,7 +47,7 @@ func (c *itemJSONCache) put(gen uint64, key string, frag []byte) {
 
 func dynamicItemKey(key string) bool {
 	switch key {
-	case "UserData", "ImageTags", "BackdropImageTags", "ImageBlurHashes", "PrimaryImageAspectRatio", "MediaSources", "Path":
+	case "UserData", "ImageTags", "BackdropImageTags", "ImageBlurHashes", "PrimaryImageAspectRatio", "MediaSources", "MediaSourceCount", "Path":
 		return true
 	default:
 		return false

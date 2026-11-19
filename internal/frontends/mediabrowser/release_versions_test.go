@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -158,6 +159,35 @@ func TestDetailListsAutoAndReleaseVariants(t *testing.T) {
 		if strings.Contains(body, "rel-2160") || strings.Contains(body, "rel-1080") {
 			t.Fatalf("%s: release ids leaked: %s", tc.name, body)
 		}
+		// Jellyfin apps that decide on a version prompt from the item alone
+		// (Neptune) read MediaSourceCount, as real Jellyfin sends it.
+		var item struct{ MediaSourceCount *int }
+		if err := json.Unmarshal(w.Body.Bytes(), &item); err != nil {
+			t.Fatal(err)
+		}
+		if tc.name == "jellyfin" && (item.MediaSourceCount == nil || *item.MediaSourceCount != 3) {
+			t.Fatalf("jellyfin: MediaSourceCount = %v, want 3", item.MediaSourceCount)
+		}
+		if tc.name == "emby" && item.MediaSourceCount != nil {
+			t.Fatalf("emby: unexpected MediaSourceCount %d", *item.MediaSourceCount)
+		}
+	}
+}
+
+// A detail page with a single source keeps Jellyfin's shape: no
+// MediaSourceCount, so apps do not prompt for a version that is not there.
+func TestDetailSingleSourceOmitsMediaSourceCount(t *testing.T) {
+	editions := &variantEditions{}
+	inst := mountVariants(t, Jellyfin{MachineID: "test"}, editions, newVariantHandles(5), frontendtest.Sessions{}, frontend.ItemDetail{Title: frontend.Title{Key: 5, Type: "movie", Title: "Movie"}})
+	r := httptest.NewRequest("GET", "/Items/"+ids.RatingKeyGUID(5), nil)
+	r.Header.Set("X-Emby-Token", "grant")
+	w := httptest.NewRecorder()
+	inst.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "MediaSourceCount") {
+		t.Fatalf("single source sent MediaSourceCount: %s", w.Body.String())
 	}
 }
 
@@ -296,4 +326,153 @@ func mediaSourcesFrom(t *testing.T, body []byte) []map[string]any {
 		t.Fatal(err)
 	}
 	return parsed.MediaSources
+}
+
+// Apps such as Neptune build their version prompt from PlaybackInfo alone.
+// With no concrete release list, PlaybackInfo offers the configured version
+// menu the item page lists: the planned Auto source, then each slot.
+func TestPlaybackInfoListsConfiguredVersionSlots(t *testing.T) {
+	slot := func(id, name string) frontend.Version {
+		return frontend.Version{ID: frontend.VersionSelectorPrefix + id, Name: name, Media: frontend.MediaInfo{Estimated: true}}
+	}
+	fourK := slot("4k", "4K")
+	fourK.Media.Streams = []frontend.StreamInfo{{Type: "video", Codec: "h264", Height: 2160, Width: 3840}}
+	detail := frontend.ItemDetail{
+		Title:    frontend.Title{Key: 5, Type: "movie", Title: "Movie"},
+		Versions: []frontend.Version{slot("default", "Default"), fourK, slot("720", "720p")},
+	}
+	handles := newVariantHandles(5, frontend.VersionSelectorPrefix+"4k", frontend.VersionSelectorPrefix+"720")
+	sessions := frontendtest.Sessions{PlanFunc: func(context.Context, frontend.PlanRequest) (frontend.PlayPlan, error) {
+		return frontend.PlayPlan{ID: "plan", Media: frontend.MediaInfo{Container: "mkv"}, Decision: frontend.Decision{Kind: "directplay", VideoCopy: true}, DirectPlay: true}, nil
+	}}
+	inst := mountVariants(t, Jellyfin{MachineID: "test"}, &variantEditions{}, handles, sessions, detail)
+	for _, body := range []string{`{"IsPlayback":false}`, `{"IsPlayback":true,"MediaSourceId":"` + ids.RatingKeyGUID(5) + `"}`} {
+		r := httptest.NewRequest("POST", "/Items/"+ids.RatingKeyGUID(5)+"/PlaybackInfo", strings.NewReader(body))
+		r.Header.Set("X-Emby-Token", "grant")
+		w := httptest.NewRecorder()
+		inst.Handler().ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		sources := mediaSourcesFrom(t, w.Body.Bytes())
+		if len(sources) != 3 {
+			t.Fatalf("%s: want Default + 2 slots, got %d: %s", body, len(sources), w.Body.String())
+		}
+		if sources[0]["Id"] != ids.RatingKeyGUID(5) || sources[0]["Name"] != "Default" {
+			t.Fatalf("%s: first source is not the planned Default: %v", body, sources[0])
+		}
+		if sources[1]["Id"] != handleFor(frontend.VersionSelectorPrefix+"4k") || sources[1]["Name"] != "4K" || sources[2]["Name"] != "720p" {
+			t.Fatalf("%s: slots missing: %v", body, sources)
+		}
+		// Neptune labels versions from the video stream, not Name: the 4K
+		// slot carries its resolution and name, never the estimated codec.
+		streams, _ := sources[1]["MediaStreams"].([]any)
+		video, _ := func() (map[string]any, bool) {
+			if len(streams) != 1 {
+				return nil, false
+			}
+			m, ok := streams[0].(map[string]any)
+			return m, ok
+		}()
+		if video == nil || video["Height"] != float64(2160) || video["DisplayTitle"] != "4K" || video["Codec"] != nil {
+			t.Fatalf("%s: 4K slot video stream: %v", body, sources[1]["MediaStreams"])
+		}
+		if s, _ := sources[2]["MediaStreams"].([]any); len(s) != 0 {
+			t.Fatalf("%s: 720p slot without a known height got streams: %v", body, s)
+		}
+		if got := w.Header().Get(versionCountHeader); got != "3" {
+			t.Fatalf("%s: version count header %q", body, got)
+		}
+	}
+}
+
+// Neptune opens a version picked from PlaybackInfo's list straight from
+// /Videos/{id}/stream?MediaSourceId=<handle>, while the only session
+// PlaybackInfo started plays Auto. The alias opens a session for exactly the
+// picked version and, when the device cannot direct play it, redirects to
+// that session's HLS stream.
+func TestStreamAliasOpensPickedVersion(t *testing.T) {
+	pick := frontend.VersionSelectorPrefix + "4k"
+	handles := newVariantHandles(5, pick)
+	var planned frontend.PlanRequest
+	var started frontend.StreamRequest
+	opened := ""
+	sessions := frontendtest.Sessions{
+		SessionsFunc: func(_ context.Context, a frontend.SessionAccess) ([]frontend.Session, error) {
+			return []frontend.Session{{ID: "auto", Protocol: "jellyfin", Device: a.Device, Item: 5}}, nil
+		},
+		PlanFunc: func(_ context.Context, req frontend.PlanRequest) (frontend.PlayPlan, error) {
+			planned = req
+			return frontend.PlayPlan{ID: "plan-4k", Decision: frontend.Decision{Kind: "copy", VideoCopy: true, AudioCopy: true}}, nil
+		},
+		OpenFunc: func(_ context.Context, req frontend.OpenRequest) (frontend.Session, error) {
+			opened = req.PlanID
+			return frontend.Session{ID: "picked", Protocol: "jellyfin", Item: 5}, nil
+		},
+		StartStreamFunc: func(_ context.Context, _ frontend.SessionAccess, id string, req frontend.StreamRequest) (string, error) {
+			if id != "picked" {
+				t.Fatalf("started session %q, want the picked version's", id)
+			}
+			started = req
+			return "/sessions/media/picked/master.m3u8", nil
+		},
+	}
+	inst := mountVariants(t, Jellyfin{MachineID: "test"}, &variantEditions{}, handles, sessions, frontend.ItemDetail{Title: frontend.Title{Key: 5, Type: "movie", Title: "Movie"}})
+	r := httptest.NewRequest("GET", "/Videos/"+ids.RatingKeyGUID(5)+"/stream?MediaSourceId="+handleFor(pick), nil)
+	r.Header.Set("Authorization", `MediaBrowser Token="grant", Client="Neptune", DeviceId="neptune"`)
+	w := httptest.NewRecorder()
+	inst.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != "/sessions/media/picked/master.m3u8" {
+		t.Fatalf("got %d %q: %s", w.Code, w.Header().Get("Location"), w.Body.String())
+	}
+	if planned.Version != handleFor(pick) || !planned.Intent.ExactVersion || opened != "plan-4k" {
+		t.Fatalf("did not plan the picked version: %+v opened %q", planned, opened)
+	}
+	if started.Format != frontend.StreamHLS {
+		t.Fatalf("stream format %v, want HLS for a device that cannot direct play", started.Format)
+	}
+}
+
+// When Auto reaches a declared-profile Jellyfin app as HLS, the other listed
+// versions are offered the same way: an HLS TranscodingUrl naming the version.
+func TestPlaybackInfoVersionsMatchAutoHLSDelivery(t *testing.T) {
+	slot := func(id, name string) frontend.Version {
+		return frontend.Version{ID: frontend.VersionSelectorPrefix + id, Name: name, Media: frontend.MediaInfo{Estimated: true}}
+	}
+	detail := frontend.ItemDetail{
+		Title:    frontend.Title{Key: 5, Type: "movie", Title: "Movie"},
+		Versions: []frontend.Version{slot("default", "Default"), slot("4k", "4K")},
+	}
+	handles := newVariantHandles(5, frontend.VersionSelectorPrefix+"4k")
+	sessions := frontendtest.Sessions{
+		PlanFunc: func(context.Context, frontend.PlanRequest) (frontend.PlayPlan, error) {
+			return frontend.PlayPlan{ID: "plan", Media: frontend.MediaInfo{Container: "mkv"}, Decision: frontend.Decision{Kind: "copy", VideoCopy: true, AudioCopy: true}, DirectStream: true, Transcoding: true}, nil
+		},
+		OpenFunc: func(context.Context, frontend.OpenRequest) (frontend.Session, error) {
+			return frontend.Session{ID: "auto", Protocol: "jellyfin", Item: 5}, nil
+		},
+		StartStreamFunc: func(context.Context, frontend.SessionAccess, string, frontend.StreamRequest) (string, error) {
+			return "/sessions/media/auto/master.m3u8", nil
+		},
+	}
+	inst := mountVariants(t, Jellyfin{MachineID: "test"}, &variantEditions{}, handles, sessions, detail)
+	body := `{"IsPlayback":true,"DeviceProfile":{"DirectPlayProfiles":[{"Container":"mp4","Type":"Video","VideoCodec":"h264,hevc"}],"TranscodingProfiles":[{"Container":"mp4","Type":"Video","Protocol":"hls","VideoCodec":"h264,hevc"}]}}`
+	r := httptest.NewRequest("POST", "/Items/"+ids.RatingKeyGUID(5)+"/PlaybackInfo", strings.NewReader(body))
+	r.Header.Set("Authorization", `MediaBrowser Token="grant", Client="Neptune", DeviceId="neptune"`)
+	w := httptest.NewRecorder()
+	inst.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	sources := mediaSourcesFrom(t, w.Body.Bytes())
+	if len(sources) != 2 {
+		t.Fatalf("want Default + 4K, got %s", w.Body.String())
+	}
+	if sources[0]["TranscodingUrl"] == nil || sources[0]["SupportsDirectPlay"] != false {
+		t.Fatalf("test setup: Auto is not HLS-only: %v", sources[0])
+	}
+	want := "/Videos/" + ids.RatingKeyGUID(5) + "/master.m3u8?MediaSourceId=" + handleFor(frontend.VersionSelectorPrefix+"4k")
+	if sources[1]["TranscodingUrl"] != want || sources[1]["SupportsDirectPlay"] != false || sources[1]["SupportsDirectStream"] != false || sources[1]["Path"] != nil {
+		t.Fatalf("4K not offered as HLS: %v", sources[1])
+	}
 }

@@ -3,6 +3,7 @@ package mediabrowser
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -222,6 +223,9 @@ func (i *instance) releaseVersionSourcesFor(r *http.Request, scope frontend.Vers
 		if !ok {
 			continue
 		}
+		if auto != nil {
+			matchAutoDelivery(r, source, auto, key)
+		}
 		out = append(out, source)
 		offered++
 	}
@@ -303,32 +307,10 @@ func (i *instance) detailSources(r *http.Request, v *frontend.Viewer, token stri
 		if scopeErr != nil {
 			break
 		}
-		handle, e := i.host.VersionHandles.Issue(i.identityContext(r), scope, key, version.ID)
-		if e != nil || handle == "" {
+		source, ok := i.slotVersionSource(r, v, token, scope, key, d.Title, version, dto)
+		if !ok {
 			needDefault = true
 			continue
-		}
-		source := i.detailMediaSourceDTO(handle, version.Media)
-		source["Name"] = version.Name
-		i.versionSourceFacts(source, version)
-		plan := frontend.PlanRequest{Viewer: v, Device: scope.Device, Protocol: i.protocol, Item: key, Version: handle, Caps: scope.Caps, Intent: frontend.PlayIntent{Estimate: true, ExactVersion: true, Options: frontend.DecideOptions{DirectPlay: true}}}
-		if path := i.lazySourceURL(r, token, plan); path != "" {
-			source["Path"] = path
-		}
-		if i.protocol == "jellyfin" {
-			offerJellyfinStatic(source, frontend.DecideOptions{DirectPlay: true, DirectStream: true})
-		}
-		i.mediaSourceDialect(source)
-		if i.protocol == "emby" {
-			i.embyMediaSourceDTO(source, ids.RatingKeyGUID(d.Title.Key), version.Media)
-		}
-		if i.protocol == "jellyfin" {
-			i.jellyfinMediaSourceDTO(source, version.Media, false)
-			if name, _ := source["Name"].(string); name == "" {
-				if itemName, ok := dto["Name"].(string); ok && itemName != "" {
-					source["Name"] = itemName
-				}
-			}
 		}
 		sources = append(sources, source)
 	}
@@ -381,4 +363,138 @@ func (i *instance) avoidVideoTranscode(ctx context.Context, req frontend.PlanReq
 		}
 	}
 	return ""
+}
+
+// setVersionCount tells the debug request log how many MediaSources
+// (versions) a detail or PlaybackInfo response offered.
+func setVersionCount(w http.ResponseWriter, sources any) {
+	if list, ok := sources.([]any); ok {
+		w.Header().Set(versionCountHeader, strconv.Itoa(len(list)))
+	}
+}
+
+// slotVersionSource renders one configured version-menu slot (or edition) as
+// a MediaSource whose Id is the scoped handle that opens it. It returns false
+// when this viewer cannot be issued the version. itemDTO supplies the
+// fallback Name (the item's own) and may be nil.
+func (i *instance) slotVersionSource(r *http.Request, v *frontend.Viewer, token string, scope frontend.VersionScope, key frontend.RatingKey, title frontend.Title, version frontend.Version, itemDTO map[string]any) (map[string]any, bool) {
+	if i.host.VersionHandles == nil {
+		return nil, false
+	}
+	handle, e := i.host.VersionHandles.Issue(i.identityContext(r), scope, key, version.ID)
+	if e != nil || handle == "" {
+		return nil, false
+	}
+	source := i.detailMediaSourceDTO(handle, version.Media)
+	source["Name"] = version.Name
+	i.versionSourceFacts(source, version)
+	plan := frontend.PlanRequest{Viewer: v, Device: scope.Device, Protocol: i.protocol, Item: key, Version: handle, Caps: scope.Caps, Intent: frontend.PlayIntent{Estimate: true, ExactVersion: true, Options: frontend.DecideOptions{DirectPlay: true}}}
+	if path := i.lazySourceURL(r, token, plan); path != "" {
+		source["Path"] = path
+	}
+	if i.protocol == "jellyfin" {
+		offerJellyfinStatic(source, frontend.DecideOptions{DirectPlay: true, DirectStream: true})
+	}
+	i.mediaSourceDialect(source)
+	if i.protocol == "emby" {
+		i.embyMediaSourceDTO(source, ids.RatingKeyGUID(title.Key), version.Media)
+	}
+	if i.protocol == "jellyfin" {
+		i.jellyfinMediaSourceDTO(source, version.Media, false)
+		if name, _ := source["Name"].(string); name == "" {
+			if itemName, ok := itemDTO["Name"].(string); ok && itemName != "" {
+				source["Name"] = itemName
+			}
+		}
+	}
+	return source, true
+}
+
+// playbackSlotSources lists, for a PlaybackInfo answer, the planned Auto
+// source followed by the item's configured version-menu slots, exactly as
+// the item page lists them. It returns nil when the item has no version
+// menu (fewer than two slots) or none of the other slots can be issued.
+func (i *instance) playbackSlotSources(r *http.Request, v *frontend.Viewer, credential string, scope frontend.VersionScope, key frontend.RatingKey, auto map[string]any) []any {
+	if i.host.Experience == nil || i.host.VersionHandles == nil || auto == nil {
+		return nil
+	}
+	d, err := i.host.Experience.Item(i.identityContext(r), frontend.ItemRequest{Viewer: v, Device: scope.Device, Key: key})
+	if err != nil || len(d.Versions) < 2 || !strings.HasPrefix(d.Versions[0].ID, frontend.VersionSelectorPrefix) {
+		return nil
+	}
+	if name := d.Versions[0].Name; name != "" {
+		auto["Name"] = name
+	}
+	out := []any{auto}
+	for _, version := range d.Versions[1:] {
+		if source, ok := i.slotVersionSource(r, v, credential, scope, key, d.Title, version, nil); ok {
+			describeSlotVideo(source, version)
+			matchAutoDelivery(r, source, auto, key)
+			out = append(out, source)
+		}
+	}
+	if len(out) < 2 {
+		return nil
+	}
+	return out
+}
+
+// matchAutoDelivery gives a listed version the delivery Auto was given when
+// this device was told not to direct play (its declared profile cannot play
+// the file): an HLS TranscodingUrl, here the version's own HLS alias, which
+// opens a session for exactly that version. Otherwise the version keeps the
+// direct-play shape the item page gives it.
+func matchAutoDelivery(r *http.Request, source, auto map[string]any, key frontend.RatingKey) {
+	if _, ok := auto["TranscodingUrl"].(string); !ok {
+		return
+	}
+	if direct, _ := auto["SupportsDirectPlay"].(bool); direct {
+		return
+	}
+	handle, _ := source["Id"].(string)
+	if handle == "" {
+		return
+	}
+	prefix, _ := r.Context().Value(prefixKey{}).(string)
+	source["SupportsDirectPlay"] = false
+	source["SupportsDirectStream"] = false
+	source["SupportsTranscoding"] = true
+	source["Protocol"] = "Http"
+	delete(source, "Path")
+	source["TranscodingUrl"] = prefix + "/Videos/" + ids.RatingKeyGUID(key) + "/master.m3u8?MediaSourceId=" + url.QueryEscape(handle)
+	source["TranscodingSubProtocol"] = "hls"
+	if container, ok := auto["TranscodingContainer"]; ok {
+		source["TranscodingContainer"] = container
+	}
+}
+
+// describeSlotVideo gives a listed version-menu slot that has no probed
+// streams one video stream carrying only its configured resolution and name.
+// Apps such as Neptune label a version from its video stream (height, codec,
+// range) and ignore MediaSource.Name, so without it every slot reads "SDR".
+// A slot's resolution is its definition, not a guess about a file; codec,
+// range and size stay unpublished until the version is played.
+func describeSlotVideo(source map[string]any, version frontend.Version) {
+	if streams, _ := source["MediaStreams"].([]any); len(streams) > 0 {
+		return
+	}
+	height, width := 0, 0
+	for _, stream := range version.Media.Streams {
+		if stream.Type == "video" && stream.Height > 0 {
+			height, width = stream.Height, stream.Width
+			break
+		}
+	}
+	if height == 0 {
+		return
+	}
+	if width == 0 {
+		width = height * 16 / 9
+	}
+	video := map[string]any{"Index": 0, "Type": "Video", "Height": height, "Width": width, "IsDefault": true, "IsExternal": false, "IsInterlaced": false}
+	if version.Name != "" {
+		video["Title"] = version.Name
+		video["DisplayTitle"] = version.Name
+	}
+	source["MediaStreams"] = []any{video}
 }
