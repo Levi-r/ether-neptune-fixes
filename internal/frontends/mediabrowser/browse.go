@@ -630,6 +630,7 @@ func (i *instance) browseRoutes() error {
 		}
 		i.markUnreleased(dto, d.Title)
 		i.applyOpenedDetail(r, v, dto, d.Title)
+		setVersionCount(w, dto["MediaSources"])
 		i.replyItems(w, r, dto)
 	}
 	endpoints := []struct {

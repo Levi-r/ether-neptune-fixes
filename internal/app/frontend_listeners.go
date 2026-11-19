@@ -19,6 +19,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/faillog"
 	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/frontend/kit/authhdr"
 	"github.com/braedonsaunders/ether/internal/sockerr"
 )
 
@@ -492,7 +493,43 @@ func (m *frontendListeners) observeFailures(id frontend.Protocol, next http.Hand
 			// because this wrapper used to count 401s and ignore the rest.
 			m.log.Warn("frontend response", "frontend", id, "method", r.Method, "route", r.URL.Path, "status", status, "reason", recorder.reason())
 		}
+		if (id == "jellyfin" || id == "emby") && m.log.Enabled(r.Context(), slog.LevelDebug) {
+			m.log.Debug("frontend request", "frontend", id, "client", mediaBrowserClient(r), "method", r.Method, "route", r.URL.Path,
+				"query", debugQuery(r.URL.Query()), "status", status, "versions", recorder.Header().Get(versionCountHeader))
+		}
 	})
+}
+
+// versionCountHeader is set by the MediaBrowser frontends on item detail and
+// PlaybackInfo responses: the number of MediaSources (versions) offered. The
+// debug request log reads it to show what an app was given.
+const versionCountHeader = "X-Ether-Media-Sources"
+
+// mediaBrowserClient names the app from its MediaBrowser authorization
+// header (Client and Version only; never the token or device id).
+func mediaBrowserClient(r *http.Request) string {
+	for _, k := range []string{"Authorization", "X-Emby-Authorization"} {
+		if p, err := authhdr.MediaBrowser(r.Header.Get(k)); err == nil && p["Client"] != "" {
+			return strings.TrimSpace(p["Client"] + " " + p["Version"])
+		}
+	}
+	return r.UserAgent()
+}
+
+// debugQuery keeps only query parameters that describe what was asked for;
+// credentials and everything else are dropped.
+func debugQuery(q url.Values) string {
+	keep := []string{"Fields", "Ids", "ParentId", "IncludeItemTypes", "MediaSourceId", "IsPlayback", "AutoOpenLiveStream", "EnableUserData"}
+	parts := make([]string, 0, len(keep))
+	for key, values := range q {
+		for _, k := range keep {
+			if strings.EqualFold(key, k) {
+				parts = append(parts, k+"="+strings.Join(values, ","))
+			}
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "&")
 }
 
 // statusReasonWriter keeps a short error body so a 503 can be logged without

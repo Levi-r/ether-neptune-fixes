@@ -667,10 +667,12 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 	// the exact release through the returned MediaSource Id.
 	if listVersions && !versionRequested && autoSwitchedRelease == "" {
 		if sources := i.releaseVersionSourcesFor(r, scope, key, variants, source); sources != nil {
+			setVersionCount(w, sources)
 			jsonReply(w, map[string]any{"MediaSources": sources, "PlaySessionId": playID})
 			return
 		}
 	}
+	setVersionCount(w, []any{source})
 	jsonReply(w, map[string]any{"MediaSources": []any{source}, "PlaySessionId": playID})
 }
 
