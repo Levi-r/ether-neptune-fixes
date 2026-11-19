@@ -326,3 +326,43 @@ func mediaSourcesFrom(t *testing.T, body []byte) []map[string]any {
 	}
 	return parsed.MediaSources
 }
+
+// Apps such as Neptune build their version prompt from PlaybackInfo alone.
+// With no concrete release list, PlaybackInfo offers the configured version
+// menu the item page lists: the planned Auto source, then each slot.
+func TestPlaybackInfoListsConfiguredVersionSlots(t *testing.T) {
+	slot := func(id, name string) frontend.Version {
+		return frontend.Version{ID: frontend.VersionSelectorPrefix + id, Name: name, Media: frontend.MediaInfo{Estimated: true}}
+	}
+	detail := frontend.ItemDetail{
+		Title:    frontend.Title{Key: 5, Type: "movie", Title: "Movie"},
+		Versions: []frontend.Version{slot("default", "Default"), slot("4k", "4K"), slot("720", "720p")},
+	}
+	handles := newVariantHandles(5, frontend.VersionSelectorPrefix+"4k", frontend.VersionSelectorPrefix+"720")
+	sessions := frontendtest.Sessions{PlanFunc: func(context.Context, frontend.PlanRequest) (frontend.PlayPlan, error) {
+		return frontend.PlayPlan{ID: "plan", Media: frontend.MediaInfo{Container: "mkv"}, Decision: frontend.Decision{Kind: "directplay", VideoCopy: true}, DirectPlay: true}, nil
+	}}
+	inst := mountVariants(t, Jellyfin{MachineID: "test"}, &variantEditions{}, handles, sessions, detail)
+	for _, body := range []string{`{"IsPlayback":false}`, `{"IsPlayback":true,"MediaSourceId":"` + ids.RatingKeyGUID(5) + `"}`} {
+		r := httptest.NewRequest("POST", "/Items/"+ids.RatingKeyGUID(5)+"/PlaybackInfo", strings.NewReader(body))
+		r.Header.Set("X-Emby-Token", "grant")
+		w := httptest.NewRecorder()
+		inst.Handler().ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		sources := mediaSourcesFrom(t, w.Body.Bytes())
+		if len(sources) != 3 {
+			t.Fatalf("%s: want Default + 2 slots, got %d: %s", body, len(sources), w.Body.String())
+		}
+		if sources[0]["Id"] != ids.RatingKeyGUID(5) || sources[0]["Name"] != "Default" {
+			t.Fatalf("%s: first source is not the planned Default: %v", body, sources[0])
+		}
+		if sources[1]["Id"] != handleFor(frontend.VersionSelectorPrefix+"4k") || sources[1]["Name"] != "4K" || sources[2]["Name"] != "720p" {
+			t.Fatalf("%s: slots missing: %v", body, sources)
+		}
+		if got := w.Header().Get(versionCountHeader); got != "3" {
+			t.Fatalf("%s: version count header %q", body, got)
+		}
+	}
+}

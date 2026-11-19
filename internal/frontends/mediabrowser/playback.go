@@ -672,6 +672,16 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Without a concrete release list, offer the same configured version
+	// menu the item page lists. Apps such as Neptune build their "select
+	// version" prompt from PlaybackInfo alone, not from the item page.
+	if !versionRequested && autoSwitchedRelease == "" && channel == "" && key != 0 && !key.IsPluginKey() {
+		if sources := i.playbackSlotSources(r, v, credential, scope, key, source); sources != nil {
+			setVersionCount(w, sources)
+			jsonReply(w, map[string]any{"MediaSources": sources, "PlaySessionId": playID})
+			return
+		}
+	}
 	setVersionCount(w, []any{source})
 	jsonReply(w, map[string]any{"MediaSources": []any{source}, "PlaySessionId": playID})
 }
