@@ -387,6 +387,6 @@ func (i *instance) avoidVideoTranscode(ctx context.Context, req frontend.PlanReq
 // (versions) a detail or PlaybackInfo response offered.
 func setVersionCount(w http.ResponseWriter, sources any) {
 	if list, ok := sources.([]any); ok {
-		w.Header().Set("X-Ether-Media-Sources", strconv.Itoa(len(list)))
+		w.Header().Set(versionCountHeader, strconv.Itoa(len(list)))
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -82,9 +84,19 @@ func (i *instance) requestLog(rt route.Route, next http.Handler) http.Handler {
 			if status == 0 {
 				status = http.StatusOK
 			}
-			i.host.Log.DebugContext(r.Context(), "request", "frontend", i.protocol,
+			attrs := []any{"frontend", i.protocol,
 				"method", safeHTTPMethod(r.Method), "route", rt.Pattern,
-				"status", status, "duration", time.Since(start))
+				"status", status, "duration", time.Since(start)}
+			if client := requestClient(r); client != "" {
+				attrs = append(attrs, "client", client)
+			}
+			if q := debugQuery(r.URL.Query()); q != "" {
+				attrs = append(attrs, "query", q)
+			}
+			if n := recorder.Header().Get(versionCountHeader); n != "" {
+				attrs = append(attrs, "versions", n)
+			}
+			i.host.Log.DebugContext(r.Context(), "request", attrs...)
 		}()
 		next.ServeHTTP(recorder, r)
 	})
@@ -156,4 +168,35 @@ func (i *instance) authenticatedRoute(rt route.Route, next http.Handler) http.Ha
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// versionCountHeader carries the number of MediaSources (versions) a detail
+// or PlaybackInfo response offered, for the debug request log.
+const versionCountHeader = "X-Ether-Media-Sources"
+
+// requestClient names the app from its MediaBrowser authorization header
+// (Client and Version only; never the token or device id).
+func requestClient(r *http.Request) string {
+	for _, k := range []string{"Authorization", "X-Emby-Authorization"} {
+		if p, err := authhdr.MediaBrowser(r.Header.Get(k)); err == nil && p["Client"] != "" {
+			return strings.TrimSpace(p["Client"] + " " + p["Version"])
+		}
+	}
+	return ""
+}
+
+// debugQuery keeps only query parameters that describe what was asked for;
+// credentials and everything else are dropped.
+func debugQuery(q url.Values) string {
+	keep := []string{"Fields", "Ids", "MediaSourceId", "IsPlayback", "AutoOpenLiveStream"}
+	parts := make([]string, 0, len(keep))
+	for key, values := range q {
+		for _, k := range keep {
+			if strings.EqualFold(key, k) {
+				parts = append(parts, k+"="+strings.Join(values, ","))
+			}
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "&")
 }
