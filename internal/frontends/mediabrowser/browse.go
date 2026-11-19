@@ -570,6 +570,13 @@ func (i *instance) browseRoutes() error {
 				dto["MediaSources"] = sources
 				if i.protocol == "jellyfin" {
 					dto["EnableMediaSourceDisplay"] = len(sources) > 1
+					// Jellyfin sets MediaSourceCount on a video with more
+					// than one version, and some apps (Neptune) open their
+					// "select version" prompt on Play only when it is > 1,
+					// without reading the MediaSources array itself.
+					if len(sources) > 1 {
+						dto["MediaSourceCount"] = len(sources)
+					}
 				}
 			}
 		}

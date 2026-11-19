@@ -158,6 +158,35 @@ func TestDetailListsAutoAndReleaseVariants(t *testing.T) {
 		if strings.Contains(body, "rel-2160") || strings.Contains(body, "rel-1080") {
 			t.Fatalf("%s: release ids leaked: %s", tc.name, body)
 		}
+		// Jellyfin apps that decide on a version prompt from the item alone
+		// (Neptune) read MediaSourceCount, as real Jellyfin sends it.
+		var item struct{ MediaSourceCount *int }
+		if err := json.Unmarshal(w.Body.Bytes(), &item); err != nil {
+			t.Fatal(err)
+		}
+		if tc.name == "jellyfin" && (item.MediaSourceCount == nil || *item.MediaSourceCount != 3) {
+			t.Fatalf("jellyfin: MediaSourceCount = %v, want 3", item.MediaSourceCount)
+		}
+		if tc.name == "emby" && item.MediaSourceCount != nil {
+			t.Fatalf("emby: unexpected MediaSourceCount %d", *item.MediaSourceCount)
+		}
+	}
+}
+
+// A detail page with a single source keeps Jellyfin's shape: no
+// MediaSourceCount, so apps do not prompt for a version that is not there.
+func TestDetailSingleSourceOmitsMediaSourceCount(t *testing.T) {
+	editions := &variantEditions{}
+	inst := mountVariants(t, Jellyfin{MachineID: "test"}, editions, newVariantHandles(5), frontendtest.Sessions{}, frontend.ItemDetail{Title: frontend.Title{Key: 5, Type: "movie", Title: "Movie"}})
+	r := httptest.NewRequest("GET", "/Items/"+ids.RatingKeyGUID(5), nil)
+	r.Header.Set("X-Emby-Token", "grant")
+	w := httptest.NewRecorder()
+	inst.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "MediaSourceCount") {
+		t.Fatalf("single source sent MediaSourceCount: %s", w.Body.String())
 	}
 }
 
